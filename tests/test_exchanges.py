@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import random
+import sys
 
 import httpx
 import pytest
@@ -160,6 +162,44 @@ def test_missing_replay_file(tmp_path, capsys) -> None:
     assert "nope.json" in capsys.readouterr().err
 
 
+def test_replay_from_stdin_matches_the_file(tmp_path, monkeypatch, capsys) -> None:
+    recorder, _ = _record()
+    path = tmp_path / "run.json"
+    recorder.write(str(path), MCP)
+    assert main(["--replay", str(path), "--json"]) == 1
+    from_file = json.loads(capsys.readouterr().out)
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(path.read_bytes())))
+    assert main(["--replay", "-", "--json"]) == 1
+    from_stdin = json.loads(capsys.readouterr().out)
+    assert from_stdin["url"] == from_file["url"]
+    assert [(c["id"], c["status"]) for c in from_stdin["checks"]] == [
+        (c["id"], c["status"]) for c in from_file["checks"]
+    ]
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(path.read_bytes())))
+    assert main(["--replay", "-"]) == 1
+    assert "(replayed from <stdin>)" in capsys.readouterr().out.splitlines()[0]
+
+
+def test_stdin_replay_errors_name_stdin(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"not json")))
+    assert main(["--replay", "-"]) == 3
+    err = capsys.readouterr().err
+    assert "<stdin>" in err
+    assert "not JSON" in err
+
+
+def test_replay_dash_on_terminal_fails_fast(monkeypatch, capsys) -> None:
+    class FakeTTY(io.TextIOWrapper):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr(sys, "stdin", FakeTTY(io.BytesIO(b"")))
+    assert main(["--replay", "-"]) == 3
+    err = capsys.readouterr().err
+    assert "<stdin>" in err
+    assert "terminal" in err
+
+
 def test_fuzzed_replay_files_never_raise_anything_else(tmp_path) -> None:
     rng = random.Random(8414)
     values = [None, True, 0, 200, 999, "", "GET", MCP, [], {}, {"a": "b"}, {"a": 1}, "\udcff"]
@@ -178,3 +218,39 @@ def test_fuzzed_replay_files_never_raise_anything_else(tmp_path) -> None:
             continue
         with httpx.Client(transport=ReplayTransport(exchanges)) as client:
             diagnose(url, Options(), client=client)
+
+
+@pytest.mark.parametrize("output_format", ["text", "markdown", "json"])
+def test_cli_replay_names_its_source(tmp_path, capsys, output_format) -> None:
+    recorder, _ = _record()
+    path = tmp_path / "recorded run.json"
+    recorder.write(str(path), MCP)
+
+    assert main(["--replay", str(path), "--format", output_format]) == 1
+    output = capsys.readouterr().out
+    if output_format == "json":
+        document = json.loads(output)
+        assert document["replayed_from"] == str(path)
+        assert document["url"] == MCP
+    else:
+        header = (
+            output.split("| Check |")[0] if output_format == "markdown" else output.splitlines()[0]
+        )
+        assert f"replayed from {path}" in header
+        assert header.index(MCP) < header.index("replayed from")
+
+
+@pytest.mark.parametrize("output_format", ["text", "markdown", "json"])
+def test_live_report_has_no_replay_annotation(output_format) -> None:
+    from mcp_auth_doctor.report import render_json, render_markdown, render_table
+
+    _, report = _record()
+    renderer = {"text": render_table, "markdown": render_markdown, "json": render_json}[
+        output_format
+    ]
+    output = renderer(report)
+    assert output == renderer(report, replayed_from=None)
+    assert "replayed from" not in output
+    if output_format == "json":
+        assert json.loads(output) == report.to_dict()
+        assert "replayed_from" not in json.loads(output)
